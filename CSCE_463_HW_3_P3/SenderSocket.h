@@ -22,6 +22,7 @@
 #define FIN_ATTEMPTS 50
 #define DATA_ATTEMPTS 50
 #define MAX_ROUTER_PACKETS 1000000
+#define WORKER_BATCH 64
 
 #pragma pack(push, 1)
 
@@ -75,6 +76,7 @@ public:
     int size;
     int attempts;
     double txTime;
+    bool timedOut;
     char pkt[MAX_PKT_SIZE];
 };
 
@@ -83,7 +85,7 @@ class SenderSocket {
 public:
     SenderSocket();
     ~SenderSocket();
-    int Open(char* targetHost, int port, int senderWindow, LinkProperties* lp);
+    int Open(char* targetHost, int port, int senderWindow, LinkProperties* lp, int extraMode = 0);
     int Send(char* buffer, int bytes);
     int Close(double* elapsedTime);
     double GetRTT();
@@ -96,7 +98,12 @@ private:
     int windowSize;
     int wsaError;
     int errorCode;
+    int mode;
+    int workerCount;
+    int sendOwner;
     bool connected;
+    bool fastRecovery;
+    bool retransmitPending;
     DWORD senderBase;
     DWORD nextSeq;
     DWORD nextToSend;
@@ -107,6 +114,8 @@ private:
     DWORD fastRetx;
     DWORD dupAcks;
     DWORD checksum;
+    DWORD workerSent[2];
+    DWORD cwndLimitedUntil;
     UINT64 ackBytes;
     double startTime;
     double estRtt;
@@ -115,24 +124,32 @@ private:
     double timerExpire;
     double firstDataTime;
     double lastAckTime;
+    double cwnd;
+    double ssthresh;
+    double ackCredit;
     HANDLE eventQuit;
     HANDLE eventDrained;
     HANDLE socketReady;
     HANDLE empty;
     HANDLE full;
-    HANDLE workerThread;
+    HANDLE stateChanged;
+    HANDLE sendReady[2];
+    HANDLE workerThread[2];
     HANDLE statsThread;
     CRITICAL_SECTION lock;
 
     static DWORD WINAPI workerStart(void* data);
+    static DWORD WINAPI secondWorkerStart(void* data);
     static DWORD WINAPI statsStart(void* data);
-    void workerRun();
+    void workerRun(int worker);
     void statsRun();
     void stopThreads();
     void cleanUp();
     void fail(int status);
     void updateRtt(double sample);
     int waitForAck(bool isSyn, double sendTime, ReceiverHeader* reply);
-    int sendPacket(DWORD seq);
+    DWORD getSendWindow();
+    void updateSendEvents();
+    int sendPacket(DWORD seq, int worker, bool newPacket);
     int receiveAck();
 };

@@ -17,7 +17,12 @@ SenderSocket::SenderSocket() {
     pending = NULL;
     windowSize = 0;
     errorCode = STATUS_OK;
+    mode = 0;
+    workerCount = 1;
+    sendOwner = -1;
     connected = false;
+    fastRecovery = false;
+    retransmitPending = false;
     senderBase = 0;
     nextSeq = 0;
     nextToSend = 0;
@@ -29,6 +34,7 @@ SenderSocket::SenderSocket() {
     dupAcks = 0;
     checksum = 0;
     ackBytes = 0;
+    cwndLimitedUntil = 0;
     startTime = getTime();
     estRtt = 0;
     devRtt = 0;
@@ -36,13 +42,21 @@ SenderSocket::SenderSocket() {
     timerExpire = 0;
     firstDataTime = 0;
     lastAckTime = 0;
+    cwnd = 1;
+    ssthresh = 2;
+    ackCredit = 0;
     eventQuit = NULL;
     eventDrained = NULL;
+    stateChanged = NULL;
     socketReady = NULL;
     empty = NULL;
     full = NULL;
-    workerThread = NULL;
     statsThread = NULL;
+    for (int i = 0; i < 2; i++) {
+        workerSent[i] = 0;
+        sendReady[i] = NULL;
+        workerThread[i] = NULL;
+    }
     InitializeCriticalSection(&lock);
     WSADATA wsaData;
     wsaError = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -58,10 +72,12 @@ void SenderSocket::stopThreads() {
     if (eventQuit != NULL) {
         SetEvent(eventQuit);
     }
-    if (workerThread != NULL) {
-        WaitForSingleObject(workerThread, INFINITE);
-        CloseHandle(workerThread);
-        workerThread = NULL;
+    for (int i = 0; i < 2; i++) {
+        if (workerThread[i] != NULL) {
+            WaitForSingleObject(workerThread[i], INFINITE);
+            CloseHandle(workerThread[i]);
+            workerThread[i] = NULL;
+        }
     }
     if (statsThread != NULL) {
         WaitForSingleObject(statsThread, INFINITE);
@@ -84,15 +100,25 @@ void SenderSocket::cleanUp() {
     if (socketReady != NULL) {
         CloseHandle(socketReady);
     }
+    if (stateChanged != NULL) {
+        CloseHandle(stateChanged);
+    }
     if (empty != NULL) {
         CloseHandle(empty);
     }
     if (full != NULL) {
         CloseHandle(full);
     }
+    for (int i = 0; i < 2; i++) {
+        if (sendReady[i] != NULL) {
+            CloseHandle(sendReady[i]);
+        }
+        sendReady[i] = NULL;
+    }
     eventQuit = NULL;
     eventDrained = NULL;
     socketReady = NULL;
+    stateChanged = NULL;
     empty = NULL;
     full = NULL;
     delete[] pending;
@@ -116,11 +142,17 @@ void SenderSocket::updateRtt(double sample) {
     }
     rto = estRtt + 4 * deviation;
 }
-int SenderSocket::Open(char* targetHost, int port, int senderWindow, LinkProperties* lp) {
+int SenderSocket::Open(char* targetHost, int port, int senderWindow, LinkProperties* lp, int extraMode) {
     if (connected) {
         return ALREADY_CONNECTED;
     }
     cleanUp();
+    mode = extraMode;
+    workerCount = 1;
+    sendOwner = -1;
+    if (mode != 0) {
+        workerCount = 2;
+    }
     if (wsaError != 0) {
         printf("Main: WSAStartup failed with %d\n", wsaError);
         return FAILED_SEND;
@@ -210,9 +242,17 @@ int SenderSocket::Open(char* targetHost, int port, int senderWindow, LinkPropert
     dupAcks = 0;
     checksum = 0;
     ackBytes = 0;
+    cwndLimitedUntil = 0;
     firstDataTime = 0;
     lastAckTime = 0;
     timerExpire = 0;
+    cwnd = 1;
+    ssthresh = windowSize;
+    ackCredit = 0;
+    fastRecovery = false;
+    retransmitPending = false;
+    workerSent[0] = 0;
+    workerSent[1] = 0;
     recvWnd = reply.recvWnd;
     effectiveWindow = recvWnd;
     if (effectiveWindow > (DWORD)windowSize) {
@@ -224,9 +264,12 @@ int SenderSocket::Open(char* targetHost, int port, int senderWindow, LinkPropert
     eventQuit = CreateEvent(NULL, TRUE, FALSE, NULL);
     eventDrained = CreateEvent(NULL, TRUE, TRUE, NULL);
     socketReady = CreateEvent(NULL, FALSE, FALSE, NULL);
+    stateChanged = CreateEvent(NULL, FALSE, FALSE, NULL);
+    sendReady[0] = CreateEvent(NULL, TRUE, FALSE, NULL);
+    sendReady[1] = CreateEvent(NULL, TRUE, FALSE, NULL);
     empty = CreateSemaphore(NULL, 0, windowSize, NULL);
     full = CreateSemaphore(NULL, 0, windowSize, NULL);
-    if (pending == NULL || eventQuit == NULL || eventDrained == NULL || socketReady == NULL || empty == NULL || full == NULL) {
+    if (pending == NULL || eventQuit == NULL || eventDrained == NULL || socketReady == NULL || stateChanged == NULL || sendReady[0] == NULL || sendReady[1] == NULL || empty == NULL || full == NULL) {
         printf("Main: cannot allocate sender resources\n");
         cleanUp();
         return FAILED_SEND;
@@ -239,10 +282,17 @@ int SenderSocket::Open(char* targetHost, int port, int senderWindow, LinkPropert
         cleanUp();
         return FAILED_RECV;
     }
-    workerThread = CreateThread(NULL, 0, workerStart, this, 0, NULL);
-    if (workerThread == NULL) {
+    workerThread[0] = CreateThread(NULL, 0, workerStart, this, 0, NULL);
+    if (workerThread[0] == NULL) {
         cleanUp();
         return FAILED_SEND;
+    }
+    if (workerCount == 2) {
+        workerThread[1] = CreateThread(NULL, 0, secondWorkerStart, this, 0, NULL);
+        if (workerThread[1] == NULL) {
+            cleanUp();
+            return FAILED_SEND;
+        }
     }
     statsThread = CreateThread(NULL, 0, statsStart, this, 0, NULL);
     if (statsThread == NULL) {
@@ -251,6 +301,34 @@ int SenderSocket::Open(char* targetHost, int port, int senderWindow, LinkPropert
     }
     connected = true;
     return STATUS_OK;
+}
+DWORD SenderSocket::getSendWindow() {
+    DWORD limit = effectiveWindow;
+    if (mode == 2) {
+        DWORD congestionWindow = (DWORD)cwnd;
+        if (congestionWindow < 1) {
+            congestionWindow = 1;
+        }
+        if (limit > congestionWindow) {
+            limit = congestionWindow;
+        }
+    }
+    return limit;
+}
+void SenderSocket::updateSendEvents() {
+    int owner = -1;
+    if (!retransmitPending && nextToSend < nextSeq && nextToSend - senderBase < getSendWindow()) {
+        owner = (nextToSend / WORKER_BATCH) % workerCount;
+    }
+    if (owner != sendOwner) {
+        if (sendOwner >= 0) {
+            ResetEvent(sendReady[sendOwner]);
+        }
+        if (owner >= 0) {
+            SetEvent(sendReady[owner]);
+        }
+        sendOwner = owner;
+    }
 }
 int SenderSocket::Send(char* buffer, int bytes) {
     if (!connected) {
@@ -278,28 +356,64 @@ int SenderSocket::Send(char* buffer, int bytes) {
     packet->size = sizeof(header) + bytes;
     packet->attempts = 0;
     packet->txTime = 0;
+    packet->timedOut = false;
     ResetEvent(eventDrained);
     nextSeq++;
-    LeaveCriticalSection(&lock);
     ReleaseSemaphore(full, 1, NULL);
+    updateSendEvents();
+    LeaveCriticalSection(&lock);
     return STATUS_OK;
 }
-int SenderSocket::sendPacket(DWORD seq) {
-    Packet* packet = pending + seq % windowSize;
-    if (packet->attempts >= DATA_ATTEMPTS) {
-        return TIMEOUT;
-    }
-    double sendTime = 0;
+int SenderSocket::sendPacket(DWORD seq, int worker, bool newPacket) {
     while (true) {
         if (WaitForSingleObject(eventQuit, 0) == WAIT_OBJECT_0) {
             return NOT_CONNECTED;
         }
-        sendTime = getTime();
+        EnterCriticalSection(&lock);
+        if (newPacket) {
+            DWORD owner = (nextToSend / WORKER_BATCH) % workerCount;
+            if (seq != nextToSend || seq >= nextSeq || owner != (DWORD)worker || retransmitPending || nextToSend - senderBase >= getSendWindow()) {
+                updateSendEvents();
+                LeaveCriticalSection(&lock);
+                return STATUS_OK;
+            }
+        }
+        Packet* packet = pending + seq % windowSize;
+        if (packet->attempts >= DATA_ATTEMPTS) {
+            LeaveCriticalSection(&lock);
+            return TIMEOUT;
+        }
+        double sendTime = getTime();
         int bytes = sendto(sock, packet->pkt, packet->size, 0, (sockaddr*)&server, sizeof(server));
         if (bytes != SOCKET_ERROR) {
-            break;
+            if (newPacket && WaitForSingleObject(full, 0) != WAIT_OBJECT_0) {
+                LeaveCriticalSection(&lock);
+                return FAILED_SEND;
+            }
+            bool wakeTimer = worker == 1 && newPacket && seq == senderBase;
+            packet->attempts++;
+            packet->txTime = sendTime;
+            if (firstDataTime == 0) {
+                firstDataTime = sendTime;
+            }
+            if (!newPacket || seq == senderBase) {
+                timerExpire = sendTime + rto;
+            }
+            if (newPacket) {
+                nextToSend++;
+                workerSent[worker]++;
+            } else {
+                retransmitPending = false;
+            }
+            updateSendEvents();
+            LeaveCriticalSection(&lock);
+            if (wakeTimer) {
+                SetEvent(stateChanged);
+            }
+            return STATUS_OK;
         }
         int error = WSAGetLastError();
+        LeaveCriticalSection(&lock);
         if (error != WSAEWOULDBLOCK) {
             printf("[%7.3f] --> failed sendto with %d\n", getTime() - startTime, error);
             return FAILED_SEND;
@@ -313,18 +427,6 @@ int SenderSocket::sendPacket(DWORD seq) {
             return FAILED_SEND;
         }
     }
-    EnterCriticalSection(&lock);
-    bool retransmission = packet->attempts > 0;
-    packet->attempts++;
-    packet->txTime = sendTime;
-    if (firstDataTime == 0) {
-        firstDataTime = sendTime;
-    }
-    if (retransmission || seq == senderBase) {
-        timerExpire = sendTime + rto;
-    }
-    LeaveCriticalSection(&lock);
-    return STATUS_OK;
 }
 int SenderSocket::receiveAck() {
     ReceiverHeader reply;
@@ -351,10 +453,16 @@ int SenderSocket::receiveAck() {
     }
     bool retransmit = false;
     DWORD seq = 0;
+    double lossWindow = 0;
+    double lossThreshold = 0;
     EnterCriticalSection(&lock);
     if (reply.ackSeq < senderBase || reply.ackSeq > nextToSend) {
         LeaveCriticalSection(&lock);
         return STATUS_OK;
+    }
+    DWORD flight = nextToSend - senderBase;
+    if (mode == 2 && flight >= (DWORD)cwnd) {
+        cwndLimitedUntil = nextToSend;
     }
     recvWnd = reply.recvWnd;
     effectiveWindow = recvWnd;
@@ -363,6 +471,7 @@ int SenderSocket::receiveAck() {
     }
     if (reply.ackSeq > senderBase) {
         DWORD oldBase = senderBase;
+        DWORD newlyAcked = reply.ackSeq - oldBase;
         Packet* first = pending + oldBase % windowSize;
         Packet* last = pending + (reply.ackSeq - 1) % windowSize;
         if (first->attempts == 1 && last->attempts == 1) {
@@ -371,6 +480,27 @@ int SenderSocket::receiveAck() {
         for (DWORD i = oldBase; i < reply.ackSeq; i++) {
             ackBytes += pending[i % windowSize].size - sizeof(SenderDataHeader);
         }
+        if (mode == 2) {
+            if (fastRecovery) {
+                cwnd = ssthresh;
+                fastRecovery = false;
+                ackCredit = 0;
+            } else if (senderBase < cwndLimitedUntil) {
+                if (cwnd < ssthresh) {
+                    cwnd++;
+                } else {
+                    DWORD limitedPackets = cwndLimitedUntil - senderBase;
+                    if (newlyAcked > limitedPackets) {
+                        newlyAcked = limitedPackets;
+                    }
+                    ackCredit += newlyAcked;
+                    if (ackCredit >= cwnd) {
+                        cwnd++;
+                        ackCredit = 0;
+                    }
+                }
+            }
+        }
         senderBase = reply.ackSeq;
         lastAckTime = recvTime;
         dupAcks = 0;
@@ -378,14 +508,31 @@ int SenderSocket::receiveAck() {
         if (senderBase == nextSeq) {
             SetEvent(eventDrained);
         }
-    }
-    else if (senderBase < nextToSend) {
+    } else if (senderBase < nextToSend) {
         dupAcks++;
         if (dupAcks == 3) {
             retransmit = true;
+            retransmitPending = true;
             seq = senderBase;
+            if (mode == 2) {
+                ssthresh = (double)flight / 2;
+                if (ssthresh < 2) {
+                    ssthresh = 2;
+                }
+                cwnd = ssthresh + 3;
+                cwndLimitedUntil = senderBase;
+                ackCredit = 0;
+                fastRecovery = true;
+                lossThreshold = ssthresh;
+            }
+        } else if (mode == 2 && fastRecovery && dupAcks > 3) {
+            cwnd++;
         }
     }
+    if (cwnd > windowSize) {
+        cwnd = windowSize;
+    }
+    lossWindow = cwnd;
     DWORD newEdge = senderBase + effectiveWindow;
     if (newEdge > lastReleased) {
         DWORD newSlots = newEdge - lastReleased;
@@ -395,9 +542,13 @@ int SenderSocket::receiveAck() {
         }
         lastReleased = newEdge;
     }
+    updateSendEvents();
     LeaveCriticalSection(&lock);
     if (retransmit) {
-        int status = sendPacket(seq);
+        if (mode == 2) {
+            printf("EC: fast recovery at %lu, cwnd %.2f, ssthresh %.2f\n", seq, lossWindow, lossThreshold);
+        }
+        int status = sendPacket(seq, 0, false);
         if (status != STATUS_OK) {
             return status;
         }
@@ -409,7 +560,12 @@ int SenderSocket::receiveAck() {
 }
 DWORD WINAPI SenderSocket::workerStart(void* data) {
     SenderSocket* sender = (SenderSocket*)data;
-    sender->workerRun();
+    sender->workerRun(0);
+    return 0;
+}
+DWORD WINAPI SenderSocket::secondWorkerStart(void* data) {
+    SenderSocket* sender = (SenderSocket*)data;
+    sender->workerRun(1);
     return 0;
 }
 DWORD WINAPI SenderSocket::statsStart(void* data) {
@@ -417,28 +573,65 @@ DWORD WINAPI SenderSocket::statsStart(void* data) {
     sender->statsRun();
     return 0;
 }
-void SenderSocket::workerRun() {
+void SenderSocket::workerRun(int worker) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    HANDLE events[] = { eventQuit, socketReady, full };
+    HANDLE events[4];
+    events[0] = eventQuit;
+    DWORD eventCount = 2;
+    if (worker == 0) {
+        events[1] = socketReady;
+        events[2] = stateChanged;
+        events[3] = sendReady[0];
+        eventCount = 4;
+    }
+    else {
+        events[1] = sendReady[1];
+    }
     while (true) {
         if (WaitForSingleObject(eventQuit, 0) == WAIT_OBJECT_0) {
             return;
         }
-        EnterCriticalSection(&lock);
-        bool expired = senderBase < nextToSend && getTime() >= timerExpire;
-        DWORD seq = senderBase;
         DWORD waitTime = INFINITE;
-        if (senderBase < nextToSend) {
-            double remaining = timerExpire - getTime();
-            if (remaining < 0) {
-                remaining = 0;
+        DWORD seq = 0;
+        bool expired = false;
+        double oldWindow = 0;
+        double threshold = 0;
+        if (worker == 0) {
+            EnterCriticalSection(&lock);
+            seq = senderBase;
+            if (senderBase < nextToSend) {
+                double remaining = timerExpire - getTime();
+                if (remaining <= 0) {
+                    expired = true;
+                    retransmitPending = true;
+                    if (mode == 2) {
+                        oldWindow = cwnd;
+                        Packet* packet = pending + seq % windowSize;
+                        if (!packet->timedOut) {
+                            ssthresh = (double)(nextToSend - senderBase) / 2;
+                            if (ssthresh < 2) {
+                                ssthresh = 2;
+                            }
+                        }
+                        packet->timedOut = true;
+                        cwnd = 1;
+                        cwndLimitedUntil = senderBase;
+                        ackCredit = 0;
+                        fastRecovery = false;
+                        threshold = ssthresh;
+                    }
+                    updateSendEvents();
+                } else {
+                    waitTime = (DWORD)ceil(remaining * 1000);
+                }
             }
-            waitTime = (DWORD)ceil(remaining * 1000);
+            LeaveCriticalSection(&lock);
         }
-        bool canSend = nextToSend < senderBase + effectiveWindow;
-        LeaveCriticalSection(&lock);
         if (expired) {
-            int status = sendPacket(seq);
+            if (mode == 2) {
+                printf("EC: timeout at %lu, cwnd %.2f -> 1.00, ssthresh %.2f\n", seq, oldWindow, threshold);
+            }
+            int status = sendPacket(seq, 0, false);
             if (status != STATUS_OK) {
                 fail(status);
                 return;
@@ -448,10 +641,6 @@ void SenderSocket::workerRun() {
             LeaveCriticalSection(&lock);
             continue;
         }
-        DWORD eventCount = 2;
-        if (canSend) {
-            eventCount = 3;
-        }
         DWORD result = WaitForMultipleObjects(eventCount, events, FALSE, waitTime);
         if (result == WAIT_OBJECT_0) {
             return;
@@ -459,7 +648,7 @@ void SenderSocket::workerRun() {
         if (result == WAIT_TIMEOUT) {
             continue;
         }
-        if (result == WAIT_OBJECT_0 + 1) {
+        if (worker == 0 && result == WAIT_OBJECT_0 + 1) {
             WSANETWORKEVENTS networkEvents;
             if (WSAEnumNetworkEvents(sock, NULL, &networkEvents) == SOCKET_ERROR) {
                 printf("Main: WSAEnumNetworkEvents failed with %d\n", WSAGetLastError());
@@ -476,21 +665,18 @@ void SenderSocket::workerRun() {
                 fail(status);
                 return;
             }
-        }
-        else if (result == WAIT_OBJECT_0 + 2) {
+        } else if (worker == 0 && result == WAIT_OBJECT_0 + 2) {
+            continue;
+        } else if ((worker == 0 && result == WAIT_OBJECT_0 + 3) || (worker == 1 && result == WAIT_OBJECT_0 + 1)) {
             EnterCriticalSection(&lock);
             seq = nextToSend;
             LeaveCriticalSection(&lock);
-            int status = sendPacket(seq);
+            int status = sendPacket(seq, worker, true);
             if (status != STATUS_OK) {
                 fail(status);
                 return;
             }
-            EnterCriticalSection(&lock);
-            nextToSend++;
-            LeaveCriticalSection(&lock);
-        }
-        else {
+        } else {
             printf("Main: worker wait failed with %lu\n", GetLastError());
             fail(FAILED_RECV);
             return;
@@ -515,9 +701,20 @@ void SenderSocket::statsRun() {
         DWORD win = effectiveWindow;
         UINT64 totalBytes = ackBytes;
         double rtt = estRtt;
+        double congestionWindow = cwnd;
+        double threshold = ssthresh;
+        DWORD firstWorker = workerSent[0];
+        DWORD secondWorker = workerSent[1];
         LeaveCriticalSection(&lock);
         double speed = (double)(totalBytes - lastBytes) * 8 / (now - lastTime) / 1000000;
         printf("[%3.0f] B %8lu (%6.1f MB) N %8lu T %lu F %lu W %lu S %.3f Mbps RTT %.3f\n", now - startTime, base, ((double)totalBytes + (double)base * sizeof(SenderDataHeader)) / 1000000, next, totalTimeouts, totalFast, win, speed, rtt);
+        if (mode != 0) {
+            printf("      EC: worker packets %lu / %lu", firstWorker, secondWorker);
+            if (mode == 2) {
+                printf(", cwnd %.2f, ssthresh %.2f", congestionWindow, threshold);
+            }
+            printf("\n");
+        }
         fflush(stdout);
         lastBytes = totalBytes;
         lastTime = now;
@@ -550,8 +747,8 @@ int SenderSocket::Close(double* elapsedTime) {
         cleanUp();
         return FAILED_RECV;
     }
-    u_long mode = 0;
-    if (ioctlsocket(sock, FIONBIO, &mode) == SOCKET_ERROR) {
+    u_long blockingMode = 0;
+    if (ioctlsocket(sock, FIONBIO, &blockingMode) == SOCKET_ERROR) {
         cleanUp();
         return FAILED_RECV;
     }
@@ -580,6 +777,12 @@ int SenderSocket::Close(double* elapsedTime) {
     if (status == STATUS_OK) {
         checksum = reply.recvWnd;
         printf("[%7.3f]\t<-- FIN-ACK %lu window %lX\n", getTime() - startTime, reply.ackSeq, checksum);
+    }
+    if (mode != 0 && status == STATUS_OK) {
+        printf("EC: final worker packets %lu / %lu\n", workerSent[0], workerSent[1]);
+        if (mode == 2) {
+            printf("EC: final cwnd %.2f, ssthresh %.2f\n", cwnd, ssthresh);
+        }
     }
     cleanUp();
     return status;

@@ -27,16 +27,18 @@ bool readDouble(char* text, double* value) {
 }
 
 void printUsage(char* program) {
-    printf("Usage: %s <host> <power> <window> <RTT-sec> <forward-loss> <return-loss> <link-Mbps>\n", program);
+    printf("Usage: %s <host> <power> <window> <RTT-sec> <forward-loss> <return-loss> <link-Mbps> [mode]\n", program);
     printf("power: 0..32, window: 1..%d, RTT: [0,30), loss: [0,1), Mbps: (0,10000]\n", MAX_ROUTER_PACKETS - FIN_ATTEMPTS);
+    printf("mode: 0 = normal, 1 = two workers, 2 = two workers with congestion control\n");
 }
 
 int main(int argc, char** argv) {
-    if (argc != 8) {
+    if (argc != 8 && argc != 9) {
         printUsage(argv[0]);
         return 1;
     }
     char* targetHost = argv[1];
+    int mode = 0;
     int power;
     int senderWindow;
     double rtt;
@@ -53,6 +55,10 @@ int main(int argc, char** argv) {
     }
     size_t maxDwords = (size_t)-1 / sizeof(DWORD);
     if (((UINT64)1 << power) > maxDwords) {
+        printUsage(argv[0]);
+        return 1;
+    }
+    if (argc == 9 && (!readInt(argv[8], &mode) || mode < 0 || mode > 2)) {
         printUsage(argv[0]);
         return 1;
     }
@@ -81,7 +87,7 @@ int main(int argc, char** argv) {
     printf("done in %.0f ms\n", (getTime() - initTime) * 1000);
     SenderSocket ss;
     double openTime = getTime();
-    int status = ss.Open(targetHost, MAGIC_PORT, senderWindow, &lp);
+    int status = ss.Open(targetHost, MAGIC_PORT, senderWindow, &lp, mode);
     double connectedTime = getTime();
     if (status != STATUS_OK) {
         printf("Main:   connect failed with status %d\n", status);
